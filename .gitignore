@@ -11,6 +11,7 @@
 # harness
 .claude/
 .agents/
+AGENTS.md
 
 # 缓存数据
 __pycache__/
