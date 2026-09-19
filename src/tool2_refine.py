@@ -19,20 +19,19 @@ import sys
 import traceback
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt, QRunnable, QThreadPool, QTimer, Signal, Slot
+from PySide6.QtCore import QObject, Qt, QRunnable, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor, QKeySequence, QShortcut
 from PySide6.QtWidgets import (QApplication, QDialog, QFileDialog, QFrame, QGraphicsOpacityEffect, QHBoxLayout,
-                               QLabel, QMenu, QMessageBox, QProgressDialog, QPushButton, QScrollArea, QSizePolicy, QStatusBar,
-                               QSizePolicy, QSplitter, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
+                               QLabel, QMenu, QMessageBox, QProgressDialog, QPushButton, QScrollArea, QSizePolicy,
+                               QSplitter, QStatusBar, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 
 import common_ui as cu
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent  # 项目根目录（脚本位于 src/ 内）
 FILTERING_DIR = PROJECT_DIR / "filtering"             # 工作目录：状态JSON 默认读写处
-ORIGINAL_DATA_DIR = FILTERING_DIR / "original_data"   # 原始数据集存放目录（选择数据集默认从这里开始）
+ORIGINAL_DATA_DIR = FILTERING_DIR / "original_data"   # 原始数据集存放目录
 COPY_DATA_DIR = FILTERING_DIR / "data"                # 最终筛选拷贝输出目录
 
 
@@ -53,7 +52,6 @@ QMainWindow, QDialog, QMenu { background:#0D1117; color:#E6EDF3; }
 QMessageBox QLabel { color:#E6EDF3; background:transparent; }
 QToolTip { background:#1A212B; color:#E6EDF3; border:1px solid #30363D; }
 QFrame#TopBar { background:#161B22; border-bottom:1px solid #21262D; }
-QLabel#navStats { color:#F0F6FC; font-weight:600; }
 QFrame#SidePanel { background:#161B22; border:1px solid #30363D; border-radius:10px; }
 QLabel#SideTitle { font-weight:600; color:#F0F6FC; font-size:13px; }
 QTreeWidget { border:none; background:transparent; color:#E6EDF3; }
@@ -479,10 +477,10 @@ class PairCard(QFrame):
 # ---------------------------------------------------------------- 放大浏览
 
 class ZoomWalkDialog(QDialog):
-    """空格放大查看：按“图片对”逐对浏览（RGB/深度并排、共享缩放）。
+    """图片对放大浏览：空格进入，或点击缩略图定位进入；RGB/深度并排、共享缩放。
 
     A/D 上一对/下一对；W 排除当前图片对（已全排除时为恢复）；S 恢复当前图片对；
-    单边排除通过两侧图片下方的按钮操作。与“点击放大”使用同一显示组件，效果一致。
+    单边排除通过两侧图片下方的按钮操作。
     """
 
     def __init__(self, parent, gd: GroupData, on_toggle_image, start_index: int = 0):
@@ -687,13 +685,13 @@ class MainWindow(QWidget):
             b.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)  # 宽度贴合文字，不随布局拉伸
         self.btn_import.setToolTip("导入工具1或工具2导出的JSON：前者按“选中区”构建，后者完整复原精筛状态")
         self.btn_copy.setToolTip("把当前保留的图片按原路径结构拷贝一份（不改动原数据集），默认目标：filtering/data")
-        # 布局：[选择数据集][拷贝 导入 导出] ……弹簧…… [统计][→工具1]（数据集路径显示在左下角状态栏）
+        # 布局：[选择数据集][拷贝 导入 导出] ……弹簧…… [→工具1]（数据集路径与统计显示在左下角状态栏）
         hlay.addWidget(self.btn_dataset)
         hlay.addWidget(self.btn_copy)
         hlay.addWidget(self.btn_import)
         hlay.addWidget(self.btn_export)
         hlay.addStretch(1)
-        hlay.addWidget(self.btn_switch)   # 切换按钮最右（统计在左下角状态栏）
+        hlay.addWidget(self.btn_switch)   # 切换按钮最右
 
         # 左：目录树
         side = QFrame()
@@ -800,11 +798,11 @@ class MainWindow(QWidget):
         sc.activated.connect(self._hk_zoom)
 
     def statusBar(self) -> QStatusBar:
-        """页面内嵌状态栏（保持 QMainWindow 时代的调用方式）。"""
+        """页面内嵌状态栏（页面嵌入 ToolShell 时随页面显示）。"""
         return self._statusbar
 
     def _notify(self, msg: str, msec: int = 4000):
-        """底部通知（自有标签，不使用 QStatusBar 临时消息，避免覆盖左侧统计信息）。"""
+        """底部短通知（独立标签，与统计信息互不遮挡）。"""
         self.notify_lbl.setText(msg)
         self._notify_timer.start(msec)
 
@@ -889,7 +887,7 @@ class MainWindow(QWidget):
             return False
         is_own = any(k in data for k in ("图片对", "仅RGB图", "仅深度图"))
         if is_own:
-            return self._import_own_format(data, file_path)
+            return self._import_own_format(data)
         sel = [str(x) for x in (data.get("选中区") or [])] if isinstance(data.get("选中区"), (list, tuple)) else []
         if not sel:
             QMessageBox.warning(self, "导入失败", "JSON 中“选中区”为空，无法构建目录树。")
@@ -923,7 +921,7 @@ class MainWindow(QWidget):
         self.groups = groups
         return True
 
-    def _import_own_format(self, data: dict, file_path) -> bool:
+    def _import_own_format(self, data: dict) -> bool:
         """导入工具2自己导出的 JSON，复原完整筛选状态。"""
         def as_list(v):
             return [str(x) for x in v] if isinstance(v, (list, tuple)) else []
@@ -935,7 +933,7 @@ class MainWindow(QWidget):
         rec_root = ((data.get("统计信息") or {}).get("数据集根目录绝对路径") or "").strip()
         group_paths = as_list(data.get("全部组"))
         if not group_paths:
-            # 旧版导出没有“全部组”：从列出的图片路径反推组目录（color/depth 的上一级）
+            # 兼容无“全部组”字段的导出：从图片路径反推组目录（color/depth 的上一级）
             derived = {str(Path(p).parent.parent) for p in (all_retained_rgb | only_depth)}
             group_paths = sorted(derived)
         if not group_paths:
@@ -1245,6 +1243,8 @@ class MainWindow(QWidget):
             gd.restore_all()
         cu.flash(self.ws_content)
         self._sync_group(gp)
+        if not excl and gd.remaining():
+            self._select_group_item(gp)   # 恢复整组后跳转到该组（与排除后的自动切换对称）
 
     def _toggle_image_excluded(self, img_path: str, depth_mode: bool):
         gp = self.img_owner.get(img_path)
@@ -1385,7 +1385,7 @@ class MainWindow(QWidget):
 
 
 def main():
-    # 复用已有 QApplication（run.py 启动器场景）；同一宿主窗口内与工具1丝滑切换
+    # 复用已有 QApplication（run.py 启动器场景）；宿主窗口内与工具1同窗切换
     app = QApplication.instance() or QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setStyleSheet(TOOL_QSS)

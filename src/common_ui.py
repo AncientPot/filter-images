@@ -1,7 +1,7 @@
 """两个数据集筛选工具共用的基础设施。
 
-包含：数据集扫描、图片异步缩略图加载（可见优先 + LRU 缓存）、
-流式缩略图条、可缩放图片面板 / 查看器、剪贴板与系统工具函数。
+包含：工具宿主窗口（同窗双工具切换）、数据集扫描、图片异步缩略图加载（可见优先 + LRU 缓存）、
+流式缩略图条、可缩放图片面板（单图 / 图片对共享缩放）、剪贴板与系统工具函数。
 
 数据集结构约定（“块” = 一级目录，“组” = 场景目录）：
 
@@ -27,8 +27,8 @@ from pathlib import Path
 from PIL import Image, ImageOps
 from PySide6.QtCore import QEvent, QMimeData, QObject, QPoint, QRect, QRunnable, QSize, Qt, QThreadPool, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QColor, QGuiApplication, QImage, QPainter, QPixmap
-from PySide6.QtWidgets import (QAbstractScrollArea, QApplication, QDialog, QFileDialog, QFrame, QHBoxLayout, QLabel, QLayout, QMainWindow, QMenu,
-                               QMessageBox, QPushButton, QScrollArea, QSizePolicy, QSplitter, QStackedWidget, QStatusBar, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QAbstractScrollArea, QApplication, QFrame, QHBoxLayout, QLabel, QLayout, QMainWindow, QMenu,
+                               QScrollArea, QSizePolicy, QSplitter, QStackedWidget, QVBoxLayout, QWidget)
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 
@@ -36,8 +36,9 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 class ToolShell(QMainWindow):
     """工具宿主窗口：同一窗口内承载两个工具页面，切换时不关窗、不换窗口。
 
-    - 页面（各工具的 MainWindow，QWidget 基类）按需懒创建并常驻，切换回时状态保留；
-    - 首次激活某页面时，若来源页面带有 _pending_handoff（数据集/选中区），自动接续加载。
+    - 页面（各工具的 MainWindow，QWidget 基类）按需懒创建并常驻；
+    - 切换时把来源页面的 _pending_handoff（数据集/选中区）交给目标页面，
+      由页面决定加载新数据集还是保留工作状态。
     """
 
     _TITLES = {"tool1": "数据集筛选 · 工具1（组级初筛）",
@@ -90,7 +91,7 @@ class ToolShell(QMainWindow):
         page = self._page(name)
         if isinstance(handoff, dict):
             try:
-                # 页面侧判断：数据集相同则保留工作状态；不同（旧数据集残留）则立即清场换新
+                # 数据集相同则保留工作状态，不同则清场加载新数据集
                 page.apply_handoff(handoff.get("root"), handoff.get("selected"))
             except Exception:
                 traceback.print_exc()
@@ -302,7 +303,7 @@ class ThumbManager(QObject):
         self._strips = weakref.WeakSet()
         self._placeholder = {}
         self._failure = {}
-        self._repri_pending = False      # 重排序请求合并标志（避免 O(N²) 定时器风暴）
+        self._repri_pending = False      # 重排序请求合并标志
         self._n_req = 0
         self._n_done = 0
         self.failed_count = 0            # 解码失败的图片数（用于状态栏提示）
@@ -361,8 +362,7 @@ class ThumbManager(QObject):
             self._dispatch()
 
     def _dispatch(self):
-        # 可见项优先出队；不做后台门限——所有请求最终都会加载，
-        # 避免任何“占位符永远不消失”的情况。
+        # 按优先级出队调度，可见项优先；所有请求最终都会加载
         limit = self._pool.maxThreadCount()
         while len(self._inflight) < limit and self._heap:
             pri, _seq, key = self._heap[0]
@@ -514,10 +514,9 @@ def _make_pixmap_cb(lbl: QLabel, size: int, fit: bool = False):
 
 
 def _geom_visible(w: QWidget, margin: int = 0) -> bool:
-    """几何可见性：控件矩形（映射到最近滚动区视口）是否与视口相交。
+    """几何可见性：控件矩形映射到最近滚动区视口后是否与其相交。
 
-    相比 visibleRegion()（依赖窗口实际曝光，未绘制/离屏时恒为空，会导致
-    可见项永远得不到加载提升），本方法只依赖布局几何，跨平台可靠。
+    只依赖布局几何，不依赖窗口绘制状态。
     """
     p = w.parentWidget()
     while p is not None:
@@ -557,7 +556,7 @@ class ThumbStrip(QWidget):
             lbl.setPixmap(manager.placeholder(thumb))
             lbl.setCursor(Qt.CursorShape.PointingHandCursor)
             lbl.setToolTip(f"{path}\n左键：查看大图；右键：复制等操作")
-            lay.addWidget(lbl)   # 关键：加入流式布局，否则控件不参与排布、被零高度容器裁剪
+            lay.addWidget(lbl)
             key = manager.make_key(path, thumb, depth)
             entry = {"lbl": lbl, "path": str(path), "depth": bool(depth), "key": key}
             self._entries.append(entry)
@@ -892,87 +891,6 @@ class PairViewWidget(QWidget):
         super().resizeEvent(ev)
         if not self._user_zoomed:
             self.fit_common()
-
-
-class ImageViewer(QDialog):
-    """单图查看对话框。"""
-
-    def __init__(self, path, depth_mode=False, parent=None):
-        super().__init__(parent)
-        p = Path(path)
-        self.path = str(path)
-        self.setWindowTitle(f"查看大图 - {p.name}")
-        self.resize(1080, 760)
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(10, 8, 10, 8)
-        top = QHBoxLayout()
-        name = QLabel(f"{p.parent.name}/{p.name}" + ("　（深度图 · 已归一化显示）" if depth_mode else ""))
-        name.setStyleSheet("font-weight:600;")
-        top.addWidget(name, 1)
-        btn_copy = QPushButton("复制图片")
-        btn_copy.clicked.connect(lambda: copy_image_to_clipboard(self.path))
-        top.addWidget(btn_copy)
-        lay.addLayout(top)
-        self.pane = FitImagePane()
-        lay.addWidget(self.pane, 1)
-        hint = QLabel("滚轮缩放 · 拖拽平移 · 双击适应窗口 · Esc 关闭")
-        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        hint.setStyleSheet("color:#8B949E;")
-        lay.addWidget(hint)
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            img = load_qimage(self.path, 2400, depth_mode)
-        finally:
-            QApplication.restoreOverrideCursor()
-        self.pane.set_image(img)
-
-
-class PairViewer(QDialog):
-    """RGB / 深度图片对并排查看（左右共享缩放，保持对称）。"""
-
-    def __init__(self, title, rgb, depth, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle(f"图片对 - {title}")
-        self.resize(1280, 760)
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(10, 8, 10, 8)
-        head = QHBoxLayout()
-        t = QLabel(title)
-        t.setStyleSheet("font-weight:600;")
-        head.addWidget(t, 1)
-        lay.addLayout(head)
-        self.viewer = PairViewWidget()
-        lay.addWidget(self.viewer, 1)
-        hint = QLabel("滚轮缩放（左右同步）· 拖拽平移 · 双击共同适应窗口 · Esc 关闭")
-        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        hint.setStyleSheet("color:#8B949E;")
-        lay.addWidget(hint)
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            rgb_img = load_qimage(str(rgb), 2200, False) if rgb else None
-            depth_img = load_qimage(str(depth), 2200, True) if depth else None
-        finally:
-            QApplication.restoreOverrideCursor()
-        self.viewer.set_images(
-            rgb_img, depth_img,
-            f"RGB · {Path(rgb).name}" if rgb else "RGB · 无",
-            f"深度 · {Path(depth).name}（已归一化）" if depth else "深度 · 无")
-        if rgb:
-            b1 = QPushButton("复制RGB图")
-            b1.clicked.connect(lambda: copy_image_to_clipboard(str(rgb)))
-            self.viewer.box_rgb.show_buttons(b1)
-        if depth:
-            b2 = QPushButton("复制深度图")
-            b2.clicked.connect(lambda: copy_image_to_clipboard(str(depth)))
-            self.viewer.box_depth.show_buttons(b2)
-
-
-def view_image(parent, path, depth_mode=False):
-    ImageViewer(str(path), depth_mode, parent).exec()
-
-
-def view_pair(parent, title, rgb, depth):
-    PairViewer(title, rgb, depth, parent).exec()
 
 
 # ---------------------------------------------------------------- 系统工具

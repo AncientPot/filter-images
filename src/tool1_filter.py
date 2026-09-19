@@ -19,7 +19,6 @@ import random
 import sys
 import traceback
 from collections import OrderedDict
-from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, Signal
@@ -52,7 +51,6 @@ QToolTip { background:#1A212B; color:#E6EDF3; border:1px solid #30363D; }
 
 QFrame#TopBar { background:#161B22; border-bottom:1px solid #21262D; }
 QLabel#navCountLbl { color:#F0F6FC; font-weight:600; }
-QLabel#navStats { color:#F0F6FC; font-weight:600; }
 QFrame#AreaPanel { background:#161B22; border:1px solid #30363D; border-radius:10px; }
 QFrame#AreaPanel[accent="sel"] { border-top:3px solid #3FB950; }
 QFrame#AreaPanel[accent="mid"] { border-top:3px solid #58A6FF; }
@@ -163,13 +161,12 @@ class BlockSection(QFrame):
 
     selectAll = Signal(str)
     excludeAll = Signal(str)
+    collapsedChanged = Signal(str, bool)   # (块名, 是否折叠)，供重建时保持折叠状态
 
     def __init__(self, block_name, collapsed=False, parent=None):
         super().__init__(parent)
         self.block = block_name
         self.setObjectName("BlockSection")
-        if collapsed:
-            self.setProperty("flash", False)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(6, 2, 6, 4)
         lay.setSpacing(3)
@@ -220,6 +217,7 @@ class BlockSection(QFrame):
         collapsed = self.body.isVisible()
         self.body.setVisible(not collapsed)
         self.btn_toggle.setText("▸" if collapsed else "▾")
+        self.collapsedChanged.emit(self.block, collapsed)
 
     def add_card(self, card, top=False):
         self.body_lay.insertWidget(0 if top else self.body_lay.count(), card)
@@ -284,7 +282,7 @@ class AreaPanel(QFrame):
 
 
 class GroupZoomDialog(QDialog):
-    """空格放大查看：浏览某组内的图片（A/D 翻页，Q 退出）。"""
+    """组内放大浏览：空格进入，或点击缩略图定位进入；A/D 翻页，Q 退出。"""
 
     def __init__(self, parent, group: cu.Group, paths, start_index: int = 0):
         super().__init__(parent)
@@ -402,7 +400,7 @@ class MainWindow(QWidget):
         for b in (self.btn_dataset, self.btn_count, self.btn_export, self.btn_import, self.btn_switch):
             b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             b.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)  # 宽度贴合文字，不随布局拉伸
-        # 布局：[选择数据集][数量 输入 保存 导入 导出] ……弹簧…… [统计][→工具2]（数据集路径显示在左下角状态栏）
+        # 布局：[选择数据集][数量 输入 保存 导入 导出] ……弹簧…… [→工具2]（数据集路径与统计显示在左下角状态栏）
         hlay.addWidget(self.btn_dataset)
         hlay.addWidget(lbl_count)
         hlay.addWidget(self.edit_count)
@@ -410,7 +408,7 @@ class MainWindow(QWidget):
         hlay.addWidget(self.btn_import)
         hlay.addWidget(self.btn_export)
         hlay.addStretch(1)
-        hlay.addWidget(self.btn_switch)   # 切换按钮最右（统计在左下角状态栏）
+        hlay.addWidget(self.btn_switch)   # 切换按钮最右
 
         self.panel_sel = AreaPanel("选中区", "sel", self.manager)
         self.panel_mid = AreaPanel("未筛选区", "mid", self.manager)
@@ -478,16 +476,16 @@ class MainWindow(QWidget):
         self.btn_import.setEnabled(ok)
 
     def statusBar(self) -> QStatusBar:
-        """页面内嵌状态栏（保持 QMainWindow 时代的调用方式）。"""
+        """页面内嵌状态栏（页面嵌入 ToolShell 时随页面显示）。"""
         return self._statusbar
 
     def _notify(self, msg: str, msec: int = 4000):
-        """底部通知（自有标签，不使用 QStatusBar 临时消息，避免覆盖左侧统计信息）。"""
+        """底部短通知（独立标签，与统计信息互不遮挡）。"""
         self.notify_lbl.setText(msg)
         self._notify_timer.start(msec)
 
     def _begin_load(self, msg: str):
-        """开始加载/导入新数据集：立即清除旧数据集的全部信息（含残留通知）。"""
+        """开始加载/导入：清空通知，状态栏切换为过程提示。"""
         self._notify_timer.stop()
         self.notify_lbl.setText("")
         self.status_lbl.setText(msg)
@@ -586,8 +584,6 @@ class MainWindow(QWidget):
             panel.clear()
         self.cards.clear()
         self.block_widgets.clear()
-        if self.root is None:
-            self.panel_mid.vlay.addWidget(self.hint_lbl)
         if not self._build_timer.isActive():
             self._build_timer.start()
 
@@ -619,6 +615,8 @@ class MainWindow(QWidget):
             sec = BlockSection(block, collapsed=block in self._collapsed)
             sec.selectAll.connect(self._select_block)
             sec.excludeAll.connect(self._exclude_block)
+            sec.collapsedChanged.connect(
+                lambda b, c: (self._collapsed.add(b) if c else self._collapsed.discard(b)))
             self.panel_mid.vlay.insertWidget(self.panel_mid.vlay.count(), sec)
             self.block_widgets[block] = sec
         return sec
@@ -779,7 +777,7 @@ class MainWindow(QWidget):
 
     # ------------------------------------------------ 工具切换
     def _switch_to_tool2(self):
-        """同窗切换到工具2：首次切换时带上数据集与选中区，之后各自保留工作状态。"""
+        """同窗切换到工具2：交接当前数据集与选中区，由宿主/页面决定加载或保留。"""
         self._pending_handoff = {
             "root": str(self.root) if self.root else None,
             "selected": list(self.selected),
@@ -923,7 +921,7 @@ class MainWindow(QWidget):
 
 
 def main():
-    # 复用已有 QApplication（run.py 启动器场景）；同一宿主窗口内与工具2丝滑切换
+    # 复用已有 QApplication（run.py 启动器场景）；宿主窗口内与工具2同窗切换
     app = QApplication.instance() or QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setStyleSheet(TOOL_QSS)
