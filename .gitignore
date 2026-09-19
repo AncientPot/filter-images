@@ -12,6 +12,7 @@
 .claude/
 .agents/
 AGENTS.md
+doc/
 
 # 缓存数据
 __pycache__/

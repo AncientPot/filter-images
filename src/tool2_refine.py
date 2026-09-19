@@ -14,6 +14,7 @@ RGB 图与深度图（不成对时允许空缺占位），该组图片**全部�
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 import traceback
@@ -21,7 +22,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt, QRunnable, QThreadPool, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, Qt, QRunnable, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor, QKeySequence, QShortcut
 from PySide6.QtWidgets import (QApplication, QDialog, QFileDialog, QFrame, QGraphicsOpacityEffect, QHBoxLayout,
                                QLabel, QMenu, QMessageBox, QProgressDialog, QPushButton, QScrollArea, QSizePolicy,
@@ -41,8 +42,27 @@ def _ensure_work_dirs():
             d.mkdir(parents=True, exist_ok=True)
         except OSError:
             pass
-THUMB = 190
-CARD_W = 2 * THUMB + 6 + 16   # 图片对卡片宽度：双缩略图 + 间距 + 内边距（工作区多列排布）
+
+
+TARGET_COLS = 4        # 工作区目标列数（一行4对，卡片宽度随视口自适应）
+THUMB_MIN, THUMB_MAX = 96, 260
+THUMB_DEF = 200
+
+
+def card_width(thumb: int) -> int:
+    return 2 * thumb + 6 + 16   # 双缩略图 + 间距 + 内边距
+
+
+def _card_thumb(view_w: int) -> int:
+    """按视口宽度计算一行 TARGET_COLS 对时的缩略图边长（限制在合理区间）。
+
+    每列预算 = (视口 − 边距) ÷ 列数 − 列间距（含末列尾随间距，整除向下取整确保放得下）。
+    """
+    if view_w <= 0:
+        return THUMB_MIN
+    unit = (view_w - 8) / TARGET_COLS - 12
+    return max(THUMB_MIN, min(THUMB_MAX, int((unit - 22) / 2)))
+
 
 ROLE_KIND = Qt.ItemDataRole.UserRole       # "block" / "group" / "excluded_group"
 ROLE_PATH = Qt.ItemDataRole.UserRole + 1   # 组绝对路径（str）
@@ -52,13 +72,13 @@ QMainWindow, QDialog, QMenu { background:#0D1117; color:#E6EDF3; }
 QMessageBox QLabel { color:#E6EDF3; background:transparent; }
 QToolTip { background:#1A212B; color:#E6EDF3; border:1px solid #30363D; }
 QFrame#TopBar { background:#161B22; border-bottom:1px solid #21262D; }
-QFrame#SidePanel { background:#161B22; border:1px solid #30363D; border-radius:10px; }
+QFrame#SidePanel { background:#161B22; border:1px solid #30363D; border-top:3px solid #D29922; border-radius:10px; }
 QLabel#SideTitle { font-weight:600; color:#F0F6FC; font-size:13px; }
 QTreeWidget { border:none; background:transparent; color:#E6EDF3; }
 QTreeWidget::item { padding:2px; }
 QTreeWidget::item:hover { background:#1A212B; }
 QTreeWidget::item:selected { background:#1F6FEB; color:#FFFFFF; }
-QFrame#WorkPanel { background:#161B22; border:1px solid #30363D; border-radius:10px; }
+QFrame#WorkPanel { background:#161B22; border:1px solid #30363D; border-top:3px solid #A371F7; border-radius:10px; }
 QScrollArea#WorkScroll { border:none; background:transparent; }
 QWidget#WorkContent { background:transparent; }
 QLabel#wsTitle { font-weight:600; color:#F0F6FC; font-size:14px; }
@@ -111,7 +131,7 @@ def normalize_stem(stem: str) -> str:
     return stem
 
 
-@dataclass
+@dataclass(eq=False)   # 按对象身份比较/哈希（放大模式精准刷新卡片依赖身份匹配）
 class Pair:
     name: str
     rgb: Path = None      # 缺失为 None
@@ -242,12 +262,32 @@ def collect_copy_files(groups: "OrderedDict[str, GroupData]"):
     return files
 
 
+def _fmt_size(n: float) -> str:
+    """字节数 → 可读容量。"""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} B"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
 def perform_copy(files, dest_root: Path, progress=None, cancel=None):
-    """同步拷贝核心：返回 (成功数, 错误列表)。progress(done, total)。"""
+    """同步拷贝核心：返回 (成功数, 错误列表)。
+
+    progress(done, total, done_bytes, total_bytes) 按文件与字节双维度上报。
+    """
     dest_root = Path(dest_root)
-    done, errs = 0, []
+    done, done_bytes = 0, 0
+    errs = []
     total = len(files)
-    for src, rel in files:
+    sizes = []
+    for src, _rel in files:
+        try:
+            sizes.append(os.path.getsize(src))
+        except OSError:
+            sizes.append(0)
+    total_bytes = sum(sizes)
+    for (src, rel), sz in zip(files, sizes):
         if cancel is not None and cancel():
             break
         try:
@@ -255,15 +295,16 @@ def perform_copy(files, dest_root: Path, progress=None, cancel=None):
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
             done += 1
+            done_bytes += sz
         except Exception as e:
             errs.append(f"{src} -> {e}")
         if progress is not None:
-            progress(done, total)
+            progress(done, total, done_bytes, total_bytes)
     return done, errs
 
 
 class _CopySignals(QObject):
-    progress = Signal(int, int)
+    progress = Signal(int, int, int, int)   # (已拷张数, 总张数, 已拷字节, 总字节)
     finished = Signal(int, list)
 
 
@@ -279,10 +320,10 @@ class _CopyJob(QRunnable):
         self._cancel = True
 
     def run(self):
-        def prog(d, t):
-            self._signals.progress.emit(d, t)
-
-        done, errs = perform_copy(self._files, self._dest, prog, lambda: self._cancel)
+        done, errs = perform_copy(
+            self._files, self._dest,
+            progress=lambda d, t, db, tb: self._signals.progress.emit(d, t, db, tb),
+            cancel=lambda: self._cancel)
         self._signals.finished.emit(done, errs)
 
 
@@ -290,17 +331,29 @@ class CopyDialog(QProgressDialog):
     """带进度条的后台拷贝对话框。"""
 
     def __init__(self, parent, files, dest):
-        super().__init__("正在拷贝文件…", "取消", 0, len(files), parent)
+        super().__init__("正在拷贝文件…", "取消", 0, 100, parent)
         self.setWindowTitle("拷贝保留图片")
         self.setWindowModality(Qt.WindowModality.WindowModal)
         self.setMinimumDuration(0)
         self._signals = _CopySignals()
-        self._signals.progress.connect(self.setValue)
+        self._signals.progress.connect(self._on_progress)
         self._signals.finished.connect(self._on_finished)
         self._job = _CopyJob(files, dest, self._signals)
         self.canceled.connect(self._job.cancel)
         QThreadPool.globalInstance().start(self._job)
         self.show()
+
+    def _on_progress(self, done, total, done_bytes, total_bytes):
+        if total_bytes > 0:
+            pct = int(done_bytes * 100 / total_bytes)
+            self.setValue(pct)
+            self.setLabelText(
+                f"正在拷贝…  {pct}%\n"
+                f"{_fmt_size(done_bytes)} / {_fmt_size(total_bytes)}　（{done} / {total} 张）")
+        else:
+            self.setMaximum(max(total, 1))
+            self.setValue(done)
+            self.setLabelText(f"正在拷贝…　（{done} / {total} 张）")
 
     def _on_finished(self, done, errs):
         self.setMaximum(1)
@@ -321,17 +374,19 @@ class CopyDialog(QProgressDialog):
 class PairCard(QFrame):
     """一个图片对卡片：名称 + 状态 + 排除按钮 + RGB/深度两栏缩略图。"""
 
-    def __init__(self, gd: GroupData, pair: Pair, manager, on_change, on_zoom=None, parent=None):
+    def __init__(self, gd: GroupData, pair: Pair, manager, on_change, on_zoom=None,
+                 thumb=THUMB_DEF, parent=None):
         super().__init__(parent)
         self.gd = gd
         self.pair = pair
         self.on_change = on_change
         self.on_zoom = on_zoom
+        self.thumb = thumb
         self.setObjectName("pairCard")
         lay = QVBoxLayout(self)
         lay.setContentsMargins(8, 6, 8, 8)
         lay.setSpacing(4)
-        self.setFixedWidth(CARD_W)
+        self.setFixedWidth(card_width(thumb))
 
         # 头行：编号 + 状态（左对齐紧随编号）…… 排除图片对（右上角）
         head = QHBoxLayout()
@@ -375,7 +430,7 @@ class PairCard(QFrame):
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(4)
         if path is not None:
-            strip = cu.ThumbStrip(manager, [(path, depth_mode)], THUMB)
+            strip = cu.ThumbStrip(manager, [(path, depth_mode)], self.thumb)
             # 深色底衬：图片居中显示在 190×190 色块上，与缺图占位框高度视觉一致
             strip.setStyleSheet("QLabel{background:#10151C;border-radius:4px;}")
             # 点击/右键查看 → 与空格一致的图片对浏览界面（定位到该对）
@@ -386,7 +441,7 @@ class PairCard(QFrame):
             miss = QLabel(f"（无{caption}图）")
             miss.setObjectName("missing")
             miss.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            miss.setFixedSize(THUMB, THUMB)
+            miss.setFixedSize(self.thumb, self.thumb)
             v.addWidget(miss, 0, Qt.AlignmentFlag.AlignHCenter)
             cap = QLabel(f"{caption} · 无")
         cap.setObjectName("paneCaption")
@@ -447,7 +502,6 @@ class PairCard(QFrame):
             status, color = "单边（无配对）", "#D29922"
         self.status.setText(status)
         self.status.setStyleSheet(f"color:{color};font-weight:600;")
-        any_retained = (self.pair.rgb is not None and not r) or (self.pair.depth is not None and not d)
         self.btn_pair.setText("恢复图片对" if (r and d) else "排除图片对")
         self.btn_pair.setObjectName("chipRestore" if (r and d) else "chipExclude")
         cu.restyle(self.btn_pair)
@@ -493,9 +547,20 @@ class ZoomWalkDialog(QDialog):
         self.resize(1360, 840)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(10, 8, 10, 8)
+        # 头行：说明文字（左）+ 排除当前图片对（右上角）
+        head = QHBoxLayout()
         self.caption = QLabel("")
         self.caption.setWordWrap(True)
-        lay.addWidget(self.caption)
+        head.addWidget(self.caption, 1)
+        self.b_pair = QPushButton("")
+        self.b_pair.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.b_pair.clicked.connect(self._toggle_pair)
+        head.addWidget(self.b_pair)
+        b_quit = QPushButton("退出 (Q)")
+        b_quit.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        b_quit.clicked.connect(self.accept)
+        head.addWidget(b_quit)
+        lay.addLayout(head)
         self.viewer = cu.PairViewWidget()
         lay.addWidget(self.viewer, 1)
 
@@ -520,14 +585,10 @@ class ZoomWalkDialog(QDialog):
         btns = QHBoxLayout()
         b_prev = QPushButton("上一对 (A)")
         b_next = QPushButton("下一对 (D)")
-        self.b_pair = QPushButton("")
-        self.b_pair.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        b_quit = QPushButton("退出 (Q)")
+        btns.addStretch(1)
         btns.addWidget(b_prev)
         btns.addWidget(b_next)
-        btns.addWidget(self.b_pair)
         btns.addStretch(1)
-        btns.addWidget(b_quit)
         lay.addLayout(btns)
         hint = QLabel("A 上一对 · D 下一对 · W 排除当前图片对 · S 恢复当前图片对 · Q/Esc 退出｜滚轮缩放（左右同步）")
         hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -535,8 +596,6 @@ class ZoomWalkDialog(QDialog):
         lay.addWidget(hint)
         b_prev.clicked.connect(lambda: self._step(-1))
         b_next.clicked.connect(lambda: self._step(1))
-        self.b_pair.clicked.connect(self._toggle_pair)
-        b_quit.clicked.connect(self.accept)
         for key, fn in (("A", lambda: self._step(-1)), ("D", lambda: self._step(1)),
                         ("Left", lambda: self._step(-1)), ("Right", lambda: self._step(1)),
                         ("W", self._toggle_pair), ("S", self._restore_pair), ("Q", self.accept)):
@@ -577,7 +636,7 @@ class ZoomWalkDialog(QDialog):
                 self.gd.exc_rgb.discard(pr.rgb)
             if pr.depth is not None:
                 self.gd.exc_depth.discard(pr.depth)
-        self.on_toggle_image()   # 通知主窗口同步（树/统计/工作区）
+        self.on_toggle_image(pr)   # 通知主窗口同步（树/统计/工作区该卡片）
 
     def _toggle_pair(self):
         any_retained = ((self.pairs[self.idx].rgb is not None and not self._side_excl(False))
@@ -599,7 +658,7 @@ class ZoomWalkDialog(QDialog):
             (self.gd.exc_depth if depth_mode else self.gd.exc_rgb).discard(p)
         else:
             (self.gd.exc_depth if depth_mode else self.gd.exc_rgb).add(p)
-        self.on_toggle_image()
+        self.on_toggle_image(pr)
         self._show_idx()
 
     # ---- 显示
@@ -614,7 +673,7 @@ class ZoomWalkDialog(QDialog):
         self.viewer.set_images(
             rgb_img, depth_img,
             f"RGB · {pr.rgb.name}" if pr.rgb is not None else "RGB · 无",
-            f"深度 · {pr.depth.name}（已归一化）" if pr.depth is not None else "深度 · 无")
+            f"深度 · {pr.depth.name}" if pr.depth is not None else "深度 · 无")
 
         r_excl, d_excl = self._side_excl(False), self._side_excl(True)
         self.viewer.box_rgb.set_excluded(r_excl)
@@ -664,6 +723,15 @@ class MainWindow(QWidget):
         self._excl_node = None
         self._syncing_tree = False
 
+        # 工作区分批建卡（应对单组上千对）：按需逐步创建，避免一次性卡顿
+        self._pair_cards = {}        # 当前组 pair -> PairCard（放大模式排除后精准刷新）
+        self._ws_thumb = THUMB_DEF   # 当前缩略图边长（随视口自适应）
+        self._ws_build_plan = []
+        self._ws_build_gp = None
+        self._ws_build_timer = QTimer(self)
+        self._ws_build_timer.setInterval(10)
+        self._ws_build_timer.timeout.connect(self._ws_build_tick)
+
         self._build_ui()
 
     # ------------------------------------------------ UI 构建
@@ -675,22 +743,26 @@ class MainWindow(QWidget):
         hlay.setSpacing(8)
         self.btn_dataset = QPushButton("选择数据集")
         self.btn_dataset.setObjectName("btnPrimary")
-        self.btn_import = QPushButton("导入")
-        self.btn_export = QPushButton("导出")
-        self.btn_copy = QPushButton("拷贝")
-        self.btn_switch = QPushButton("→ 工具1")
+        self.btn_import = QPushButton("导入json")
+        self.btn_export = QPushButton("导出json")
+        self.btn_copy = QPushButton("导出合格数据")
+        self.btn_switch = QPushButton("→ 数据粗筛")
         self.btn_switch.setToolTip("同窗切回工具1（组级初筛）：数据集保持一致，两侧工作状态各自保留")
-        for b in (self.btn_dataset, self.btn_import, self.btn_export, self.btn_copy, self.btn_switch):
+        self.btn_json_help = QPushButton("JSON说明")
+        self.btn_json_help.setToolTip("查看两个工具导出 JSON 的结构说明")
+        for b in (self.btn_dataset, self.btn_import, self.btn_export, self.btn_copy,
+                  self.btn_switch, self.btn_json_help):
             b.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # 避免按钮抢占空格快捷键
             b.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)  # 宽度贴合文字，不随布局拉伸
         self.btn_import.setToolTip("导入工具1或工具2导出的JSON：前者按“选中区”构建，后者完整复原精筛状态")
-        self.btn_copy.setToolTip("把当前保留的图片按原路径结构拷贝一份（不改动原数据集），默认目标：filtering/data")
-        # 布局：[选择数据集][拷贝 导入 导出] ……弹簧…… [→工具1]（数据集路径与统计显示在左下角状态栏）
+        self.btn_copy.setToolTip("把当前保留（合格）的图片按原路径结构导出一份（不改动原数据集），默认目标：filtering/data")
+        # 布局：[选择数据集][导出合格数据 导入json 导出json] ……弹簧…… [→工具1]（数据集路径与统计显示在左下角状态栏）
         hlay.addWidget(self.btn_dataset)
         hlay.addWidget(self.btn_copy)
         hlay.addWidget(self.btn_import)
         hlay.addWidget(self.btn_export)
         hlay.addStretch(1)
+        hlay.addWidget(self.btn_json_help)
         hlay.addWidget(self.btn_switch)   # 切换按钮最右
 
         # 左：目录树
@@ -781,15 +853,23 @@ class MainWindow(QWidget):
         self.thumb_progress_lbl.setStyleSheet("color:#D29922;")
         self.statusBar().addPermanentWidget(self.thumb_progress_lbl)
         self.manager.progress.connect(self._on_thumb_progress)
-        help_lbl = QLabel("空格 放大查看图片对（A/D 换对 · W/S 排除/恢复 · Q 退出）｜缩略图左键查看图片对 · 右键复制")
+        help_lbl = QLabel("右键复制 · 左键/空格：放大查看图片（A/D换对 · W/S排除/恢复 · Q退出）")
         help_lbl.setStyleSheet("color:#8B949E;")
         self.statusBar().addPermanentWidget(help_lbl)
+
+        self._ws_relayout_timer = QTimer(self)
+        self._ws_relayout_timer.setSingleShot(True)
+        self._ws_relayout_timer.setInterval(150)
+        self._ws_relayout_timer.timeout.connect(self._relayout_workspace)
+        self.ws_scroll.installEventFilter(self)
 
         self.btn_dataset.clicked.connect(self._choose_dataset)
         self.btn_import.clicked.connect(self._import_dialog)
         self.btn_export.clicked.connect(self._export_dialog)
         self.btn_copy.clicked.connect(self._copy_dialog)
         self.btn_switch.clicked.connect(self._switch_to_tool1)
+        self.btn_json_help.clicked.connect(
+            lambda: cu.JsonHelpDialog("tool2", self).exec())
         self.btn_group_excl.clicked.connect(self._toggle_group_excluded)
         self.tree.itemSelectionChanged.connect(self._on_tree_sel)
         # 快捷键限定在本页面内生效（同窗双页面下避免串扰）
@@ -835,6 +915,19 @@ class MainWindow(QWidget):
         except Exception:
             traceback.print_exc()
 
+    def eventFilter(self, obj, ev):
+        if obj is self.ws_scroll and ev.type() == QEvent.Type.Resize:
+            self._ws_relayout_timer.start()
+        return super().eventFilter(obj, ev)
+
+    def _relayout_workspace(self):
+        """视口尺寸变化后重算列宽；缩略图边长变化时重排当前组。"""
+        new_thumb = _card_thumb(self.ws_scroll.viewport().width())
+        if new_thumb != self._ws_thumb:
+            self._ws_thumb = new_thumb
+            if self.current_group is not None:
+                self._show_group(self.current_group)
+
     def _on_thumb_progress(self, done: int, total: int):
         """状态栏实时显示缩略图加载进度与失败计数。"""
         if total and done < total:
@@ -856,11 +949,10 @@ class MainWindow(QWidget):
 
     def load_dataset(self, root: Path):
         self._begin_load(f"正在扫描数据集：{root} …")
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            groups = cu.scan_dataset(root)
-        finally:
-            QApplication.restoreOverrideCursor()
+        groups = cu.scan_dataset_async(self, root)   # 后台扫描，带进度与取消
+        if groups is None:
+            self._update_nav_stats()
+            return
         if not groups:
             QMessageBox.warning(self, "未发现数据",
                                 "该目录下未发现符合结构的数据（需存在包含 color/ 或 depth/ 子目录的场景目录）。")
@@ -1009,7 +1101,10 @@ class MainWindow(QWidget):
         for gp, gd in self.groups.items():
             self._ensure_group_item(gp)
         self._prune_tree()
-        self.tree.expandAll()
+        for block_item in self._tree_blocks.values():
+            block_item.setExpanded(True)
+        if self._excl_node is not None:
+            self._excl_node.setExpanded(False)
         self._syncing_tree = False
 
     def _rel_wo_block(self, gd: GroupData):
@@ -1062,7 +1157,12 @@ class MainWindow(QWidget):
             self._excl_node = QTreeWidgetItem(["已排除组（0）"])
             self._excl_node.setData(0, ROLE_KIND, "excluded_root")
             self._excl_node.setForeground(0, QBrush(QColor("#F85149")))
-            self.tree.addTopLevelItem(self._excl_node)
+            # 固定插入到最上方，且默认折叠；不受其它块增删影响
+            self.tree.insertTopLevelItem(0, self._excl_node)
+            self._excl_node.setExpanded(False)
+        elif self.tree.indexOfTopLevelItem(self._excl_node) != 0:
+            self.tree.takeTopLevelItem(self.tree.indexOfTopLevelItem(self._excl_node))
+            self.tree.insertTopLevelItem(0, self._excl_node)
         return self._excl_node
 
     def _prune_tree(self):
@@ -1098,8 +1198,8 @@ class MainWindow(QWidget):
                 n += 1
         return n
 
-    def _sync_group(self, gp):
-        """组排除状态变化后同步目录树 / 工作区 / 统计。"""
+    def _sync_group(self, gp, pair=None):
+        """组排除状态变化后同步目录树 / 工作区 / 统计；pair 指定时精准刷新该卡片。"""
         gd = self.groups[gp]
         was_current = self.current_group == gp
         self._ensure_group_item(gp)
@@ -1107,6 +1207,9 @@ class MainWindow(QWidget):
         self._update_nav_stats()
         if was_current:
             self._refresh_ws_header()
+            card = self._pair_cards.get(pair) if pair is not None else None
+            if card is not None:
+                card._refresh()   # 放大模式下的排除立即反映到工作区
             if not gd.remaining():
                 self._advance_if_dead(gp)
 
@@ -1167,6 +1270,9 @@ class MainWindow(QWidget):
     # ------------------------------------------------ 工作区
     def _show_group(self, gp):
         self.current_group = gp
+        self._ws_build_timer.stop()
+        self._ws_build_plan = []
+        self._pair_cards = {}
         while self.ws_lay.count():
             itm = self.ws_lay.takeAt(0)
             w = itm.widget()
@@ -1193,15 +1299,34 @@ class MainWindow(QWidget):
         self.ws_title.setToolTip(str(gd.path))
         self.btn_group_excl.setEnabled(True)
         self._refresh_ws_header()
-        for pair in gd.pairs:
-            self.ws_lay.addWidget(PairCard(gd, pair, self.manager,
-                                            lambda p=gp: self._on_pair_change(p),
-                                            on_zoom=lambda pr, g0=gd: self._open_zoom_at(str(g0.path), pr)))
         if not gd.pairs:
             hint = QLabel("该组没有图片。")
             hint.setStyleSheet("color:#9AA4AF;")
             self.ws_lay.addWidget(hint)
-        self.manager.schedule_reprioritize()
+            return
+        self._ws_build_gp = gp
+        self._ws_build_plan = list(gd.pairs)
+        self._ws_build_timer.start()
+
+    def _ws_build_tick(self):
+        """每拍创建若干图片对卡片；大组（上千对）渐进填充，界面保持响应。"""
+        gp = self._ws_build_gp
+        gd = self.groups.get(gp)
+        if gd is None or self.current_group != gp or not self._ws_build_plan:
+            self._ws_build_timer.stop()
+            self._ws_build_plan = []
+            return
+        for _ in range(min(20, len(self._ws_build_plan))):
+            pair = self._ws_build_plan.pop(0)
+            card = PairCard(gd, pair, self.manager,
+                            lambda p=gp: self._on_pair_change(p),
+                            on_zoom=lambda pr, g0=gd: self._open_zoom_at(str(g0.path), pr),
+                            thumb=self._ws_thumb)
+            self._pair_cards[pair] = card
+            self.ws_lay.addWidget(card)
+        if not self._ws_build_plan:
+            self._ws_build_timer.stop()
+            self.manager.schedule_reprioritize()
 
     def _refresh_ws_header(self):
         gd = self.groups.get(self.current_group)
@@ -1261,18 +1386,28 @@ class MainWindow(QWidget):
         self._sync_group(gp)
 
     def _update_nav_stats(self):
-        tr = td = gn = 0
+        tr = td = gn = only_r = only_d = 0
         blocks = set()
         for gd in self.groups.values():
             if not gd.remaining():
                 continue
             gn += 1
             blocks.add(gd.block)
-            tr += len(gd.rgb_retained())
-            td += len(gd.depth_retained())
+            for pr in gd.pairs:
+                r = pr.rgb is not None and pr.rgb not in gd.exc_rgb
+                d = pr.depth is not None and pr.depth not in gd.exc_depth
+                if r and d:
+                    tr += 1
+                    td += 1
+                elif r:
+                    tr += 1
+                    only_r += 1
+                elif d:
+                    td += 1
+                    only_d += 1
         self.status_lbl.setText(
-            f"数据集：{self.root or '—'}　｜　保留RGB {tr} 张 · 保留深度 {td} 张 ｜ "
-            f"剩余组 {gn} ｜ 块 {len(blocks)}　｜　组总数 {len(self.groups)}")
+            f"数据集：{self.root or '—'}　｜　块 {len(blocks)} · 组 {gn} · RGB {tr} · Depth {td} · "
+            f"仅RGB {only_r} · 仅Depth {only_d}")
 
     # ------------------------------------------------ 快捷键
     def _hk_zoom(self):
@@ -1307,7 +1442,7 @@ class MainWindow(QWidget):
         idx = 0
         if pair is not None:
             idx = next((i for i, pr in enumerate(pairs) if pr is pair), 0)
-        ZoomWalkDialog(self, gd, lambda: self._sync_group(gp), start_index=idx).exec()
+        ZoomWalkDialog(self, gd, lambda pair: self._sync_group(gp, pair), start_index=idx).exec()
 
     # ------------------------------------------------ 导出 / 拷贝
     def collect_state(self) -> dict:
@@ -1385,7 +1520,7 @@ class MainWindow(QWidget):
 
 
 def main():
-    # 复用已有 QApplication（run.py 启动器场景）；宿主窗口内与工具1同窗切换
+    # 复用已有 QApplication；宿主窗口内与工具1同窗切换
     app = QApplication.instance() or QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setStyleSheet(TOOL_QSS)

@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from PIL import Image
 from PySide6.QtCore import QTimer
-from PySide6.QtWidgets import QApplication, QDialog, QMainWindow, QMessageBox
+from PySide6.QtWidgets import QApplication, QMainWindow, QMessageBox
 
 import common_ui as cu
 import tool1_filter as t1

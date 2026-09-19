@@ -84,6 +84,7 @@ def main():
     # 3. 选中一个组显示工作区
     win._select_group_item(str(target.path))
     expect(win.current_group == str(target.path), "工作区未切换")
+    pump_events(400)   # 分批建卡推进
     cards = [w for i in range(win.ws_lay.count())
              if (w := win.ws_lay.itemAt(i).widget()) is not None and isinstance(w, t2.PairCard)]
     expect(len(cards) == 5, f"卡片数 {len(cards)}")
@@ -123,7 +124,6 @@ def main():
     expect(win.current_group != gp_d, "应自动切换到下一个组")
 
     # 8. 导出
-    state = win.collect_state()
     f2 = OUT / "state2.json"
     expect(win.export_to(f2), "导出失败")
     data = json.loads(f2.read_text(encoding="utf-8"))

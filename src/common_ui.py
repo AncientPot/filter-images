@@ -27,8 +27,8 @@ from pathlib import Path
 from PIL import Image, ImageOps
 from PySide6.QtCore import QEvent, QMimeData, QObject, QPoint, QRect, QRunnable, QSize, Qt, QThreadPool, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QColor, QGuiApplication, QImage, QPainter, QPixmap
-from PySide6.QtWidgets import (QAbstractScrollArea, QApplication, QFrame, QHBoxLayout, QLabel, QLayout, QMainWindow, QMenu,
-                               QScrollArea, QSizePolicy, QSplitter, QStackedWidget, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QAbstractScrollArea, QApplication, QDialog, QFrame, QHBoxLayout, QLabel, QLayout, QMainWindow, QMenu,
+                               QPushButton, QScrollArea, QSizePolicy, QSplitter, QStackedWidget, QVBoxLayout, QWidget)
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 
@@ -41,13 +41,14 @@ class ToolShell(QMainWindow):
       由页面决定加载新数据集还是保留工作状态。
     """
 
-    _TITLES = {"tool1": "数据集筛选 · 工具1（组级初筛）",
-               "tool2": "数据集精筛 · 工具2（RGB/深度对比删减）"}
+    _TITLES = {"tool1": "数据粗筛",
+               "tool2": "数据精筛选"}
 
     def __init__(self, initial="tool1", parent=None):
         super().__init__(parent)
         self.setWindowTitle("数据集筛选工具集")
         self.resize(1600, 920)
+        self.setMinimumSize(1320, 680)   # 最小窗口：默认布局下工作区可容 4 对、三区列数正常
         self._pages = {}
         self.stack = QStackedWidget()
         self.setCentralWidget(self.stack)
@@ -173,20 +174,32 @@ def make_group(scene_dir, root) -> Group:
                  list_images(depth_dir) if depth_dir else [])
 
 
-def scan_dataset(root) -> list:
+class ScanCancelled(Exception):
+    """用户取消了扫描。"""
+
+
+def scan_dataset(root, progress=None, cancel=None) -> list:
     """扫描数据集：返回按 块/相对路径 自然排序的 Group 列表。
 
     判定规则：某目录下存在 color/ 或 depth/ 子目录（大小写不敏感）即视为“组”，
     不再向其内部递归；“块” = 组的一级上级目录。
+    progress(n_dirs, n_groups) 周期性上报进度；cancel() 返回 True 时中止并抛 ScanCancelled。
     """
     root = Path(root).resolve()
     groups = []
+    n_dirs = 0
 
     def is_scene(d: Path) -> bool:
         return (_child_dir(d, _COLOR_NAMES) is not None
                 or _child_dir(d, _DEPTH_NAMES) is not None)
 
     def walk(d: Path, depth: int):
+        nonlocal n_dirs
+        n_dirs += 1
+        if cancel is not None and cancel():
+            raise ScanCancelled()
+        if progress is not None and n_dirs % 100 == 0:
+            progress(n_dirs, len(groups))
         try:
             entries = [e for e in os.scandir(d) if e.is_dir() and not e.name.startswith(".")]
         except OSError:
@@ -201,6 +214,66 @@ def scan_dataset(root) -> list:
 
     walk(root, 0)
     return groups
+
+
+class _ScanSignals(QObject):
+    progress = Signal(int, int)
+    finished = Signal(object)   # Group 列表；取消/出错为 None
+
+
+class _ScanJob(QRunnable):
+    def __init__(self, root, signals):
+        super().__init__()
+        self._root = root
+        self._signals = signals
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def run(self):
+        try:
+            groups = scan_dataset(
+                self._root,
+                progress=lambda d, g: self._signals.progress.emit(d, g),
+                cancel=lambda: self._cancel)
+        except Exception:
+            traceback.print_exc()
+            groups = None
+        self._signals.finished.emit(groups)
+
+
+def scan_dataset_async(parent, root):
+    """后台扫描（带进度对话框、可取消）；返回 Group 列表，取消/出错返回 None。
+
+    内部使用局部事件循环等待结果，UI 保持响应。
+    """
+    from PySide6.QtCore import QEventLoop
+    from PySide6.QtWidgets import QProgressDialog
+    dlg = QProgressDialog("正在扫描数据集…", "取消", 0, 0, parent)
+    dlg.setWindowTitle("扫描数据集")
+    dlg.setWindowModality(Qt.WindowModality.WindowModal)
+    dlg.setMinimumDuration(0)
+    dlg.setMinimumWidth(440)
+    signals = _ScanSignals()
+    job = _ScanJob(root, signals)
+    result = [None]
+    loop = QEventLoop()
+
+    def on_finished(groups):
+        result[0] = groups
+        loop.quit()
+
+    signals.progress.connect(
+        lambda d, g: dlg.setLabelText(f"正在扫描数据集…\n已扫描 {d} 个目录 · 发现 {g} 个组"))
+    signals.finished.connect(on_finished)
+    dlg.canceled.connect(job.cancel)
+    QThreadPool.globalInstance().start(job)
+    dlg.show()
+    loop.exec()
+    dlg.reset()
+    dlg.close()
+    return result[0]
 
 
 # ---------------------------------------------------------------- 图片加载
@@ -269,6 +342,8 @@ def load_qimage(path, max_size: int, depth_mode: bool = False):
 
 _VISIBLE_PRI = 0      # 可见项优先
 _DEFAULT_PRI = 9      # 普通后台项
+_LOAD_MARGIN = 600    # 距视口该范围内开始加载
+_UNLOAD_MARGIN = 1600 # 距视口超出该范围回收内存（比加载范围大，形成滞回带避免抖动）
 
 
 class _LoadJob(QRunnable):
@@ -361,6 +436,10 @@ class ThumbManager(QObject):
             heappush(self._heap, (pri, self._seq, key))
             self._dispatch()
 
+    def release(self, key: tuple):
+        """取消一个待加载请求（用于缩略图离屏回收；进行中的任务照常完成并进缓存）。"""
+        self._pending.pop(key, None)
+
     def _dispatch(self):
         # 按优先级出队调度，可见项优先；所有请求最终都会加载
         limit = self._pool.maxThreadCount()
@@ -413,7 +492,7 @@ class ThumbManager(QObject):
         self._repri_pending = False
         for strip in list(self._strips):
             try:
-                strip.prioritize_visible()  # 内部自带 isVisible + 几何可见性判断
+                strip.update_load_state()   # 按可见性加载/回收
             except RuntimeError:
                 pass
 
@@ -488,10 +567,11 @@ class FlowLayout(QLayout):
         return y + line_h + m.bottom() - rect.y()
 
 
-def _make_pixmap_cb(lbl: QLabel, size: int, fit: bool = False):
+def _make_pixmap_cb(lbl: QLabel, size: int, fit: bool = False, wanted: dict = None):
     """缩略图交付回调：等比缩放到 size 内。
 
     fit=True 时标签同时收缩为图片实际尺寸——紧凑排布，消除方形标签内的上下空白。
+    wanted 为缩略图条目的引用：若交付时该条目已被回收（不再需要），直接丢弃。
     """
     ref = weakref.ref(lbl)
 
@@ -499,6 +579,8 @@ def _make_pixmap_cb(lbl: QLabel, size: int, fit: bool = False):
         target = ref()
         if target is None:
             return
+        if wanted is not None and not wanted.get("requested"):
+            return   # 离屏回收后到达的过期交付
         try:
             pm2 = pm.scaled(size, size,
                             Qt.AspectRatioMode.KeepAspectRatio,
@@ -532,7 +614,10 @@ def _geom_visible(w: QWidget, margin: int = 0) -> bool:
 
 
 class ThumbStrip(QWidget):
-    """一组缩略图（流式布局）。左键查看大图；右键：查看 / 复制图片 / 复制路径 / 打开所在文件夹。"""
+    """一组缩略图（流式布局）：可见时才加载，离屏自动回收内存。
+
+    左键查看大图；右键：查看 / 复制图片 / 复制路径 / 打开所在文件夹。
+    """
 
     viewRequested = Signal(str, bool)   # (图片绝对路径, 是否深度图)
 
@@ -546,6 +631,7 @@ class ThumbStrip(QWidget):
         super().__init__(parent)
         self._manager = manager
         self._thumb = thumb
+        self._fit = fit_height
         self._entries = []
         lay = FlowLayout(self, margin=0, hspacing=spacing, vspacing=spacing)
         self.setLayout(lay)
@@ -558,25 +644,47 @@ class ThumbStrip(QWidget):
             lbl.setToolTip(f"{path}\n左键：查看大图；右键：复制等操作")
             lay.addWidget(lbl)
             key = manager.make_key(path, thumb, depth)
-            entry = {"lbl": lbl, "path": str(path), "depth": bool(depth), "key": key}
+            entry = {"lbl": lbl, "path": str(path), "depth": bool(depth),
+                     "key": key, "requested": False}
             self._entries.append(entry)
             lbl.installEventFilter(self)
-            manager.get(key, _make_pixmap_cb(lbl, thumb, fit_height))
         manager.register_strip(self)
 
-    def prioritize_visible(self):
-        """把几何可见（含滚动缓冲范围）的未加载缩略图提升为优先加载。"""
+    def update_load_state(self):
+        """按当前几何可见性决定加载或回收（由管理器在滚动/显示时统一调度）。"""
         if not self.isVisible():
+            self.unload()
             return
-        if not _geom_visible(self, margin=600):
-            return
+        if _geom_visible(self, margin=_LOAD_MARGIN):
+            mgr = self._manager
+            for e in self._entries:
+                try:
+                    if e["lbl"].property("loaded"):
+                        continue
+                    if not e["requested"]:
+                        e["requested"] = True
+                        mgr.get(e["key"], _make_pixmap_cb(e["lbl"], self._thumb, self._fit, e))
+                    else:
+                        mgr.set_priority(e["key"], _VISIBLE_PRI)
+                except RuntimeError:
+                    continue
+        elif not _geom_visible(self, margin=_UNLOAD_MARGIN):
+            self.unload()
+
+    def unload(self):
+        """回收本条全部缩略图内存（恢复占位符并取消待加载请求）。"""
         mgr = self._manager
         for e in self._entries:
-            lbl = e["lbl"]
             try:
-                if lbl.property("loaded"):
+                lbl = e["lbl"]
+                if not e["requested"] and not lbl.property("loaded"):
                     continue
-                mgr.set_priority(e["key"], _VISIBLE_PRI)
+                e["requested"] = False
+                mgr.release(e["key"])
+                if self._fit:
+                    lbl.setFixedSize(self._thumb, self._thumb)
+                lbl.setPixmap(mgr.placeholder(self._thumb))
+                lbl.setProperty("loaded", False)
             except RuntimeError:
                 continue
 
@@ -891,6 +999,74 @@ class PairViewWidget(QWidget):
         super().resizeEvent(ev)
         if not self._user_zoomed:
             self.fit_common()
+
+
+class JsonHelpDialog(QDialog):
+    """两个工具导出 JSON 的结构说明。"""
+
+    TOOL1_HELP = """工具1 · 粗筛_数据集名.json（组级筛选状态）
+
+{
+  "未筛选区": ["组绝对路径", ...],
+  "选中区":   ["组绝对路径", ...],
+  "排除区":   ["组绝对路径", ...],
+  "统计信息": {
+    "数据集根目录绝对路径": "...",
+    "总块数": 0, "总组数": 0,
+    "选中组数": 0, "排除组数": 0,
+    "总RGB图数": 0, "选中总RGB图数": 0, "排除总RGB图数": 0
+  }
+}
+
+· 三个区域均存储组（场景目录）的绝对路径，按当前界面顺序排列；
+· 导入时校验“数据集根目录绝对路径”，与当前数据集不一致将拒绝导入。"""
+
+    TOOL2_HELP = """工具2 · 精筛_数据集名.json（图片级精筛状态）
+
+{
+  "图片对":   ["指向RGB图的绝对路径", ...],
+  "仅RGB图":  ["绝对路径", ...],
+  "仅深度图": ["绝对路径", ...],
+  "全部组":   ["组绝对路径", ...],
+  "统计信息": {
+    "数据集根目录绝对路径": "...",
+    "最终保留的总块数": 0, "最终保留的总组数": 0,
+    "最终保留的总RGB图数": 0, "最终保留的总深度图数": 0,
+    "仅RGB图总数": 0, "仅深度图总数": 0
+  }
+}
+
+· “图片对”存储完整保留对的RGB图路径（其深度图视为保留）；
+· “仅RGB图/仅深度图”为单边保留的图片路径；
+· “全部组”为会话内全部组（含完全排除的组），供本工具导入时完整复原；
+  导入时未列出的图片即视为已排除；
+· 该 JSON 可由工具2「导入json」复原会话。"""
+
+    def __init__(self, tool: str, parent=None):
+        """tool: "tool1" 显示粗筛结构，"tool2" 显示精筛结构。"""
+        super().__init__(parent)
+        if tool == "tool2":
+            title, text = "工具2 · 精筛 JSON 结构说明", self.TOOL2_HELP
+        else:
+            title, text = "工具1 · 粗筛 JSON 结构说明", self.TOOL1_HELP
+        self.setWindowTitle(title)
+        self.resize(680, 560)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(12, 10, 12, 10)
+        from PySide6.QtWidgets import QTextEdit
+        te = QTextEdit()
+        te.setReadOnly(True)
+        te.setPlainText(text)
+        te.setStyleSheet(
+            "QTextEdit{background:#0D1117;color:#E6EDF3;border:1px solid #30363D;"
+            "font-family:Consolas,'Microsoft YaHei UI',monospace;font-size:12px;}")
+        lay.addWidget(te, 1)
+        btn = QPushButton("关闭")
+        btn.clicked.connect(self.accept)
+        bl = QHBoxLayout()
+        bl.addStretch(1)
+        bl.addWidget(btn)
+        lay.addLayout(bl)
 
 
 # ---------------------------------------------------------------- 系统工具

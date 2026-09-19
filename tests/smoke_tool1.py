@@ -9,16 +9,13 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from PySide6.QtCore import QTimer
-from PySide6.QtWidgets import QApplication
-
-import common_ui as cu
-import tool1_filter as t1
-
 from datetime import datetime, timedelta
 
 from PySide6.QtCore import QTimer
-from PySide6.QtWidgets import QMessageBox
+from PySide6.QtWidgets import QApplication, QMessageBox
+
+import common_ui as cu
+import tool1_filter as t1
 
 HERE = Path(__file__).resolve().parent
 DUMMY = HERE.parent / "filtering" / "test_data"
@@ -80,8 +77,10 @@ def main():
         assert len(set(geos)) == len(geos), f"标签位置重叠，未正确排布: {geos}"
     all_labels = [e["lbl"] for s in nonempty for e in s._entries]
     loaded = sum(1 for l in all_labels if l.property("loaded"))
-    assert loaded == len(all_labels) >= 30, f"缩略图加载不全: {loaded}/{len(all_labels)}"
-    assert all(not l.pixmap().isNull() for l in all_labels), "存在空pixmap标签"
+    # 懒加载：视口内（含缓冲带）的缩略图应加载，其余保持占位
+    assert loaded >= 10, f"可见缩略图未加载: {loaded}/{len(all_labels)}"
+    loaded_lbls = [l for l in all_labels if l.property("loaded")]
+    assert all(not l.pixmap().isNull() for l in loaded_lbls), "已加载标签存在空pixmap"
 
     # 2. 移动：选中顶部、排除新顶部
     top1 = win._top_unfiltered()

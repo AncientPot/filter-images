@@ -11,7 +11,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from PySide6.QtCore import QTimer
-from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 import common_ui as cu
 import tool2_refine as t2
@@ -98,7 +98,7 @@ def main():
     expect(win.import_json(STATE1), "导入失败")
     pump(400)
     gd = next(g for g in win.groups.values() if any(p.rgb and p.depth for p in g.pairs))
-    dlg = t2.ZoomWalkDialog(win, gd, lambda: win._sync_group(str(gd.path)))
+    dlg = t2.ZoomWalkDialog(win, gd, lambda pair: win._sync_group(str(gd.path), pair))
     expect(len(dlg.pairs) == len(gd.pairs), "浏览序列应为图片对列表")
     first = dlg.pairs[0]
     # 当前对应同时具备两侧图（完整对）

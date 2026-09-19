@@ -21,7 +21,7 @@ import traceback
 from collections import OrderedDict
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, Qt, QTimer, Signal
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (QApplication, QDialog, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
                                QMessageBox, QPushButton, QScrollArea, QSizePolicy, QSplitter, QStatusBar,
@@ -41,8 +41,24 @@ def _ensure_work_dirs():
             d.mkdir(parents=True, exist_ok=True)
         except OSError:
             pass
-DEFAULT_COUNT = 6
-THUMB = 148
+
+
+DEFAULT_COUNT = 15
+MID_COLS = 5         # 未筛选区目标列数（缩略图随视口自适应）
+SIDE_COLS = 3        # 选中/排除区目标列数
+THUMB = 136          # 未筛选区缩略图默认尺寸（视口未就绪时回退）
+THUMB_SIDE = 104     # 选中/排除区默认尺寸
+_MID_RANGE = (96, 240)
+_SIDE_RANGE = (64, 180)
+
+
+def _panel_thumb(view_w: int, cols: int, rng) -> int:
+    """按视口宽度计算一行 cols 张时的缩略图边长（8px 量化，抑制滚动条抖动）。"""
+    if view_w <= 0:
+        return 0
+    raw = (view_w - 48 - (cols - 1) * 4) / cols   # 面板/卡片/滚动区边距与列间距
+    v = max(rng[0], min(rng[1], int(raw)))
+    return v // 8 * 8
 
 TOOL_QSS = """
 QMainWindow, QDialog, QMenu { background:#0D1117; color:#E6EDF3; }
@@ -228,6 +244,47 @@ class BlockSection(QFrame):
         self.btn_all_exc.setEnabled(groups > 0)
 
 
+class EmptyBlocksBar(QWidget):
+    """空块折叠条：一行开关 + 可展开的块名标签流。"""
+
+    expandedChanged = Signal(bool)
+
+    def __init__(self, names, expanded=False, parent=None):
+        super().__init__(parent)
+        self._names = list(names)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(6, 2, 6, 2)
+        v.setSpacing(4)
+        self.btn = QPushButton()
+        self.btn.setObjectName("btnToggle")
+        self.btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn.clicked.connect(self._toggle)
+        v.addWidget(self.btn)
+        chips = QWidget()
+        self.chips_lay = cu.FlowLayout(chips, margin=0, hspacing=6, vspacing=4)
+        for n in self._names:
+            chip = QLabel(n)
+            chip.setStyleSheet(
+                "background:#161B22;border:1px solid #30363D;border-radius:10px;"
+                "padding:2px 8px;color:#8B949E;")
+            self.chips_lay.addWidget(chip)
+        chips.setVisible(expanded)
+        self._chips = chips
+        v.addWidget(chips)
+        self._apply_text(expanded)
+
+    def _toggle(self):
+        expanded = not self._chips.isVisible()
+        self._chips.setVisible(expanded)
+        self._apply_text(expanded)
+        self.expandedChanged.emit(expanded)
+
+    def _apply_text(self, expanded):
+        self.btn.setText(f"{'▾' if expanded else '▸'} 空块 {len(self._names)} 个"
+                         f"（{'点击收起' if expanded else '点击展开'}）")
+
+
 class AreaPanel(QFrame):
     """左 / 中 / 右三个区域面板：标题 + 计数 + 滚动内容。"""
 
@@ -363,6 +420,9 @@ class MainWindow(QWidget):
         self.cards = {}                        # (区域, 组路径) -> GroupCard
         self.block_widgets = {}                # 块名 -> BlockSection
         self._collapsed = set()
+        self._empty_expanded = False   # 空块折叠条的展开状态（跨刷新保留）
+        self._empty_row = None
+        self._thumbs_in_use = {}       # 区域 -> 当前缩略图边长（视口变化时判断是否重排）
         self._build_plan = []
         self._build_timer = QTimer(self)
         self._build_timer.setInterval(10)
@@ -393,14 +453,17 @@ class MainWindow(QWidget):
         self.btn_count = QPushButton("保存")
         self.btn_count.setObjectName("chipRestore")
         self.btn_count.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.btn_export = QPushButton("导出")
-        self.btn_import = QPushButton("导入")
-        self.btn_switch = QPushButton("→ 工具2")
+        self.btn_export = QPushButton("导出json")
+        self.btn_import = QPushButton("导入json")
+        self.btn_switch = QPushButton("→ 数据精筛")
         self.btn_switch.setToolTip("同窗切换到工具2（RGB/深度精筛）：首次自动带上数据集与选中区，两侧工作状态各自保留")
-        for b in (self.btn_dataset, self.btn_count, self.btn_export, self.btn_import, self.btn_switch):
+        self.btn_json_help = QPushButton("JSON说明")
+        self.btn_json_help.setToolTip("查看两个工具导出 JSON 的结构说明")
+        for b in (self.btn_dataset, self.btn_count, self.btn_export, self.btn_import,
+                  self.btn_switch, self.btn_json_help):
             b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             b.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)  # 宽度贴合文字，不随布局拉伸
-        # 布局：[选择数据集][数量 输入 保存 导入 导出] ……弹簧…… [→工具2]（数据集路径与统计显示在左下角状态栏）
+        # 布局：[选择数据集][数量 输入 保存 导入json 导出json] ……弹簧…… [→工具2]（数据集路径与统计显示在左下角状态栏）
         hlay.addWidget(self.btn_dataset)
         hlay.addWidget(lbl_count)
         hlay.addWidget(self.edit_count)
@@ -408,11 +471,15 @@ class MainWindow(QWidget):
         hlay.addWidget(self.btn_import)
         hlay.addWidget(self.btn_export)
         hlay.addStretch(1)
+        hlay.addWidget(self.btn_json_help)
         hlay.addWidget(self.btn_switch)   # 切换按钮最右
 
         self.panel_sel = AreaPanel("选中区", "sel", self.manager)
         self.panel_mid = AreaPanel("未筛选区", "mid", self.manager)
         self.panel_exc = AreaPanel("排除区", "exc", self.manager)
+        # 侧区最小宽度：保证最小窗口下 3 列缩略图放得下
+        self.panel_sel.setMinimumWidth(320)
+        self.panel_exc.setMinimumWidth(320)
         split = QSplitter()
         split.addWidget(self.panel_sel)
         split.addWidget(self.panel_mid)
@@ -454,15 +521,24 @@ class MainWindow(QWidget):
         self.thumb_progress_lbl.setStyleSheet("color:#D29922;")
         self.statusBar().addPermanentWidget(self.thumb_progress_lbl)
         self.manager.progress.connect(self._on_thumb_progress)
-        help_lbl = QLabel("快捷键：A 选中 · D 排除 · S 撤销 · 空格 放大查看未筛选区｜图片：左键查看 · 右键复制")
+        help_lbl = QLabel("A选中 · D排除 · 右键复制 · 左键/空格：放大查看图片（A上一张 · D下一张 · Q退出）")
         help_lbl.setStyleSheet("color:#8B949E;")
         self.statusBar().addPermanentWidget(help_lbl)
+
+        self._relayout_timer = QTimer(self)
+        self._relayout_timer.setSingleShot(True)
+        self._relayout_timer.setInterval(200)
+        self._relayout_timer.timeout.connect(self._relayout_if_needed)
+        for panel in (self.panel_sel, self.panel_mid, self.panel_exc):
+            panel.scroll.installEventFilter(self)
 
         self.btn_dataset.clicked.connect(self._choose_dataset)
         self.btn_count.clicked.connect(self._save_count)
         self.btn_export.clicked.connect(self._export_dialog)
         self.btn_import.clicked.connect(self._import_dialog)
         self.btn_switch.clicked.connect(self._switch_to_tool2)
+        self.btn_json_help.clicked.connect(
+            lambda: cu.JsonHelpDialog("tool1", self).exec())
 
         # 快捷键限定在本页面内生效（同窗双页面下避免串扰）
         for key, fn in (("A", self._hk_select), ("D", self._hk_exclude),
@@ -470,6 +546,42 @@ class MainWindow(QWidget):
             sc = QShortcut(QKeySequence(key), self)
             sc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
             sc.activated.connect(fn)
+
+    def eventFilter(self, obj, ev):
+        if ev.type() == QEvent.Type.Resize and self.root is not None:
+            self._relayout_timer.start()
+        return super().eventFilter(obj, ev)
+
+    def _card_strip_width(self, area):
+        """取该区域任一现存卡片的条宽（卡片宽度与缩略图尺寸无关，读数稳定）。"""
+        for (a, _gp), card in self.cards.items():
+            if a == area:
+                return card.width() - 12
+        return None
+
+    def _relayout_if_needed(self):
+        """视口尺寸变化后，若目标缩略图尺寸改变则全量重排（保持目标列数）。
+
+        仅对已有卡片的区域按“实际卡片宽度”（与缩略图尺寸无关，读数稳定）重算；
+        空区域无卡片可量，维持当前尺寸即可。
+        """
+        if self.root is None or self._build_plan:
+            return
+        want = dict(self._thumbs_in_use)
+        for area, cols, rng in (("mid", MID_COLS, _MID_RANGE),
+                                ("sel", SIDE_COLS, _SIDE_RANGE),
+                                ("exc", SIDE_COLS, _SIDE_RANGE)):
+            strip_w = self._card_strip_width(area)
+            if strip_w is not None:
+                v = max(rng[0], min(rng[1], int((strip_w - (cols - 1) * 4) / cols))) // 8 * 8
+                want[area] = v
+        # 量化后仍有差异才重排（阈值消除滚动条出现/消失引起的宽度抖动震荡）；
+        # 先写回目标尺寸再重建，保证重建的卡片采用新尺寸、循环可收敛
+        changed = {a: v for a, v in want.items()
+                   if abs(v - (self._thumbs_in_use.get(a) or 0)) >= 8}
+        if changed:
+            self._thumbs_in_use.update(changed)
+            self._rebuild_all()
 
     def _set_dataset_enabled(self, ok: bool):
         self.btn_export.setEnabled(ok)
@@ -517,11 +629,10 @@ class MainWindow(QWidget):
             if r != QMessageBox.StandardButton.Yes:
                 return
         self._begin_load(f"正在扫描数据集：{root} …")
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            groups = cu.scan_dataset(root)
-        finally:
-            QApplication.restoreOverrideCursor()
+        groups = cu.scan_dataset_async(self, root)   # 后台扫描，带进度与取消
+        if groups is None:
+            self._update_counts()
+            return
         if not groups:
             QMessageBox.warning(self, "未发现数据",
                                 "该目录下未发现符合结构的数据（需存在包含 color/ 或 depth/ 子目录的场景目录）。")
@@ -592,6 +703,7 @@ class MainWindow(QWidget):
             self._build_timer.stop()
             self.manager.schedule_reprioritize()
             self._update_counts()
+            self._relayout_timer.start()   # 建卡完成后按实际卡片宽度校正一次列数
             return
         for _ in range(min(12, len(self._build_plan))):
             area, path = self._build_plan.pop(0)
@@ -621,22 +733,39 @@ class MainWindow(QWidget):
             self.block_widgets[block] = sec
         return sec
 
+    def _panel_thumb_now(self, panel, cols, rng, fallback):
+        v = _panel_thumb(panel.scroll.viewport().width(), cols, rng)
+        return v or fallback
+
     def _insert_card(self, area, path, top) -> GroupCard:
         g = self.groups[path]
         sample = self.samples.get(path, [])
-        zoom_at = lambda p, gp=path: self._open_group_zoom_at(gp, p)
+        def zoom_at(p, gp=path):
+            return self._open_group_zoom_at(gp, p)
         if area == "mid":
             sec = self._ensure_block_section(g.block)
+            sec.setVisible(True)   # 恢复到曾折叠的空块时重新显示该块
+            thumb = self._thumbs_in_use.get("mid") or self._panel_thumb_now(
+                self.panel_mid, MID_COLS, _MID_RANGE, THUMB)
+            self._thumbs_in_use["mid"] = thumb
             card = GroupCard(g, sample, self.manager, "mid",
                              {"select": self._select_group, "exclude": self._exclude_group,
-                              "zoom_at": zoom_at})
+                              "zoom_at": zoom_at}, thumb=thumb)
             sec.add_card(card, top=top)
             if top:
                 self.panel_mid.vlay.insertWidget(0, sec)
         else:
-            card = GroupCard(g, sample, self.manager, area,
-                             {"restore": self._restore_group, "zoom_at": zoom_at})
             panel = self.panel_sel if area == "sel" else self.panel_exc
+            key = "sel" if area == "sel" else "exc"
+            thumb = self._thumbs_in_use.get(key)
+            if not thumb:
+                strip_w = self._card_strip_width(area) or (panel.scroll.viewport().width() - 48)
+                raw = int((strip_w - (SIDE_COLS - 1) * 4) / SIDE_COLS)
+                thumb = max(_SIDE_RANGE[0], min(_SIDE_RANGE[1], raw)) // 8 * 8
+            self._thumbs_in_use[key] = thumb
+            card = GroupCard(g, sample, self.manager, area,
+                             {"restore": self._restore_group, "zoom_at": zoom_at},
+                             thumb=thumb)
             panel.vlay.insertWidget(0 if top else panel.vlay.count(), card)
         self.cards[(area, path)] = card
         cu.flash(card)
@@ -808,11 +937,31 @@ class MainWindow(QWidget):
             return sum(len(self.groups[p].rgb) for p in paths)
 
         self.status_lbl.setText(
-            f"数据集：{self.root or '—'}　｜　块 {len(self.blocks)} · 组 {len(self.groups)} · "
-            f"RGB {total_img} 张　｜　未筛选 {len(unf)}（{img_of(unf)}） · "
+            f"数据集：{self.root or '—'}　｜　块 {len(self.blocks)} · 组 {len(self.groups)} · 图 {total_img} · "
+            f"未筛选 {len(unf)}（{img_of(unf)}） · "
             f"已选 {len(self.selected)}（{img_of(self.selected)}） · 已排 {len(self.excluded)}（{img_of(self.excluded)}）")
         for b in list(self.block_widgets):
             self._update_block_section_stats(b)
+        self._refresh_empty_blocks()
+
+    def _refresh_empty_blocks(self):
+        """多个无组的块折叠为一行开关（可展开块名标签流），避免占用空间。"""
+        if getattr(self, "_empty_row", None) is not None:
+            self._empty_row.setParent(None)
+            self._empty_row.deleteLater()
+            self._empty_row = None
+        empty = [b for b, gs in self.unfiltered_blocks.items() if not gs]
+        for b, sec in self.block_widgets.items():
+            sec.setVisible(bool(self.unfiltered_blocks.get(b)))
+        if not empty:
+            return
+        bar = EmptyBlocksBar(empty, expanded=self._empty_expanded)
+        bar.expandedChanged.connect(self._on_empty_expanded)
+        self.panel_mid.vlay.addWidget(bar)
+        self._empty_row = bar
+
+    def _on_empty_expanded(self, expanded: bool):
+        self._empty_expanded = expanded
 
     def collect_state(self) -> dict:
         unf = self._flatten_unfiltered()
@@ -921,7 +1070,7 @@ class MainWindow(QWidget):
 
 
 def main():
-    # 复用已有 QApplication（run.py 启动器场景）；宿主窗口内与工具2同窗切换
+    # 复用已有 QApplication；宿主窗口内与工具2同窗切换
     app = QApplication.instance() or QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setStyleSheet(TOOL_QSS)
