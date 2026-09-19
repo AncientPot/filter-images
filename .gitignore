@@ -16,3 +16,11 @@ AGENTS.md
 # 缓存数据
 __pycache__/
 .pytest_cache/
+
+# 数据工作目录
+filtering/
+
+# 测试产物
+tests/out/
+tests/out_data/
+

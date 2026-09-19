@@ -3,5 +3,6 @@ name = "filter-images"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
+    "pillow>=12.3.0",
     "pyside6>=6.11.2",
 ]
