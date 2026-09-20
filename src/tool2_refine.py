@@ -105,6 +105,7 @@ QPushButton#chipExclude:hover { background:#4A1D20; }
 QPushButton#chipRestore { color:#58A6FF; border-color:#1F6EBB; background:#0E2233; }
 QPushButton#chipRestore:hover { background:#14375A; }
 QStatusBar { background:#161B22; color:#8B949E; }
+QStatusBar QLabel { color:#C9D1D9; }   /* 浅色文字，避免跟随系统浅色调色板变黑 */
 
 QScrollBar:vertical { background:transparent; width:10px; margin:2px; }
 QScrollBar::handle:vertical { background:#30363D; border-radius:5px; min-height:24px; }

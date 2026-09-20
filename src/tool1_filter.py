@@ -101,6 +101,7 @@ QPushButton#btnToggle { background:transparent; border:none; color:#8B949E; font
 
 QLineEdit { padding:3px 8px; border:1px solid #30363D; border-radius:6px; background:#0D1117; color:#F0F6FC; selection-background-color:#1F6FEB; }
 QStatusBar { background:#161B22; color:#8B949E; }
+QStatusBar QLabel { color:#C9D1D9; }   /* 浅色文字，避免跟随系统浅色调色板变黑 */
 
 QScrollBar:vertical { background:transparent; width:10px; margin:2px; }
 QScrollBar::handle:vertical { background:#30363D; border-radius:5px; min-height:24px; }
